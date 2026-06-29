@@ -354,6 +354,7 @@ class GPUCacheContext(BaseCacheContext):
         engine_group_infos: Sequence[EngineGroupInfo] = (),
         engine_type: EngineType = EngineType.VLLM,
         separate_object_groups: bool = True,
+        full_sw_kv: bool = False,
     ):
         unwrapped = unwrap_kv_cache_tensors(kv_caches)
         kv_caches_norm, engine_kv_formats = normalize_and_discover_per_layer_formats(
@@ -372,6 +373,11 @@ class GPUCacheContext(BaseCacheContext):
             lmcache_tokens_per_chunk=lmcache_tokens_per_chunk,
             separate_object_groups=separate_object_groups,
         )
+        # CacheBlend caches full per-chunk SWA KV (reuse at any position). Enable
+        # it on the manager BEFORE the temp buffer / object groups are built so
+        # both are sized for the full geometry; see enable_full_sw_kv.
+        if full_sw_kv:
+            kv_layer_groups_manager.enable_full_sw_kv()
 
         # Pre-allocated GPU buffer for block IDs (up to 1M elements).
         # The caller copies block_ids into this buffer before launching the

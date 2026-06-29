@@ -430,6 +430,9 @@ class KVLayerGroupsManager:
         self._lmcache_tokens_per_chunk = lmcache_tokens_per_chunk
         self._separate_object_groups = separate_object_groups
 
+        # When True, sliding-window groups store/transfer FULL per-chunk KV
+        self._full_sw_kv = False
+
         logger.info(
             "KV layer groups: ---\n%s\n---",
             "\n".join(repr(g) for g in self._kernel_groups),
@@ -526,6 +529,14 @@ class KVLayerGroupsManager:
         sw_size = self.get_subchunk_sw_size_tokens(kernel_group_idx)
         return group.calculate_slots(sw_size)
 
+    def enable_full_sw_kv(self) -> None:
+        """Store/transfer FULL per-chunk KV for sliding-window groups.
+
+        Default windowing keeps only each chunk's last sub-chunk window, valid
+        only at the chunk's original position.  
+        """
+        self._full_sw_kv = True
+
     def get_subchunk_sw_size_tokens(self, kernel_group_idx: int) -> int:
         """Return the sub-chunk sliding window size of a given kernel group.
         The size is measured in the number of tokens.
@@ -542,6 +553,10 @@ class KVLayerGroupsManager:
             window models.
         """
         sw_size_tokens = self._kernel_groups[kernel_group_idx].sw_size_tokens
+        # CacheBlend stores full per-chunk SWA KV (reuse at arbitrary positions);
+        # report the window as the full chunk so store/transfer keep every block.
+        if self._full_sw_kv:
+            return self._lmcache_tokens_per_chunk
         if sw_size_tokens == -1 or sw_size_tokens >= self._lmcache_tokens_per_chunk:
             return self._lmcache_tokens_per_chunk
         return sw_size_tokens
@@ -558,6 +573,11 @@ class KVLayerGroupsManager:
             With object-group separation disabled (the default), the result
             has a single full-attention entry.
         """
+        if self._full_sw_kv:
+            # CacheBlend full per-chunk SWA KV: every group reports full
+            # attention, no cross-chunk window skipping (mirrors the sub-chunk
+            # override in get_subchunk_sw_size_tokens).
+            return AttnWindowDesc(num_chunks_in_sw=[-1] * len(self._object_groups))
         return AttnWindowDesc(
             num_chunks_in_sw=[
                 w if w >= 1 else -1

@@ -1436,7 +1436,7 @@ class BlendV3Module(InstanceLivenessTarget):
         self,
         key: IPCCacheServerKey,
         cb_match_result: list[CBMatchResult],
-        gpu_block_ids: list[int],
+        gpu_block_ids: list[list[int]],
         instance_id: int,
         event_ipc_handle: bytes,
     ) -> tuple[bytes, bool]:
@@ -1453,7 +1453,9 @@ class BlendV3Module(InstanceLivenessTarget):
             key (IPCCacheServerKey): The request key.
             cb_match_result (list[CBMatchResult]): Matched ranges to scatter
                 (prefix-hit and shifted), any order.
-            gpu_block_ids (list[int]): This request's full paged block table.
+            gpu_block_ids (list[list[int]]): This request's paged block table
+                per engine (kernel) group; single-group models pass [[...]].
+                Mirrors the engine RETRIEVE/STORE per-group block-id contract.
             instance_id (int): Target KV-cache instance.
             event_ipc_handle (bytes): IPC handle to the forward's CUDA event.
 
@@ -1550,8 +1552,9 @@ class BlendV3Module(InstanceLivenessTarget):
             check_interprocess_event_support()
             event = torch_dev.Event(interprocess=True)
 
-            # Staged once (single group), sliced per chunk inside the loop.
-            all_block_ids_gpu = gpu_context.stage_block_ids([gpu_block_ids])[0]
+            # One staged block-id tensor per engine (kernel) group, indexed by
+            # group. A single shared mapping corrupts all but group 0 under HMA
+            block_ids_per_group_gpu = gpu_context.stage_block_ids(gpu_block_ids)
 
             self._event_bus.publish_on_stream(
                 gpu_context.cupy_stream,
@@ -1586,7 +1589,9 @@ class BlendV3Module(InstanceLivenessTarget):
                     # Per-token scatter handles any cur_st; just bound the
                     # matched range to the allocated slots.
                     pairs: list[tuple[CBMatchResult, Any]] = []
-                    num_slots = int(all_block_ids_gpu.numel()) * tokens_per_block
+                    num_slots = (
+                        int(block_ids_per_group_gpu[0].numel()) * tokens_per_block
+                    )
                     for r, memory_obj in zip(cb_match_result, memory_objs, strict=True):
                         if r.cur_ed > num_slots:
                             logger.warning(
@@ -1670,11 +1675,13 @@ class BlendV3Module(InstanceLivenessTarget):
                                     for (r, _) in batch
                                 ]
                             )
-                            slot_mapping = all_block_ids_gpu[pos // bs] * bs + (
-                                pos % bs
-                            )
                             page_buffer_size = gpu_context.num_blocks * bs
                             for group_idx in range(num_groups):
+                                # Per-group paged block table 
+                                group_block_ids = block_ids_per_group_gpu[group_idx]
+                                slot_mapping = group_block_ids[pos // bs] * bs + (
+                                    pos % bs
+                                )
                                 tmp_buffers = [
                                     gpu_context.get_temp_kernel_group_buffer(
                                         slot_idx, group_idx
